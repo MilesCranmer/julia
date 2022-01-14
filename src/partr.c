@@ -458,6 +458,7 @@ JL_DLLEXPORT jl_task_t *jl_task_get_next(jl_value_t *trypoptask, jl_value_t *q)
                     jl_atomic_store(&ptls->sleep_check_state, not_sleeping); // let other threads know they don't need to wake us
                 continue;
             }
+            __sync_synchronize();
             task = get_next_task(trypoptask, q); // WARNING: this should not yield
             if (ptls != ct->ptls)
                 continue; // oops, get_next_task did yield--start over
