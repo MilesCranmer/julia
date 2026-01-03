@@ -3389,6 +3389,33 @@ function create_expr_cache(pkg::PkgId, input::PkgLoadSpec, output::String, outpu
         push!(opts, "--trace-compile-timing")
     end
 
+    # Environment for the precompile worker. Always single-thread Julia/BLAS here.
+    #
+    # Optional: a Rust-like incremental compilation mode for pkgimages.
+    #
+    # When JULIA_PKGIMAGE_INCREMENTAL is set, we:
+    #   1. split native code emission into multiple *shards* (codegen units) even in a single-threaded worker,
+    #   2. enable stable shard partitioning, and
+    #   3. allow reuse of previously-emitted shard object files via a content-addressed cache.
+    #
+    # This targets the dominant LLVM optimize+codegen time in repeated pkgimage rebuilds.
+    env = Pair{String,Any}[
+        "OPENBLAS_NUM_THREADS" => 1,
+        "JULIA_NUM_THREADS" => 1,
+    ]
+    if output_o !== nothing && get(ENV, "JULIA_PKGIMAGE_INCREMENTAL", nothing) !== nothing
+        # Share the shard cache across projects/prefs: the cache is content-addressed on IR,
+        # and precompile locking already uses this same (prefs_hash=0, project="") key.
+        shard_cache_dir = compilecache_path(pkg, UInt64(0); flags=cacheflags, project="") * ".shards"
+        mkpath(shard_cache_dir)
+        nshards = something(tryparse(Int, get(ENV, "JULIA_PKGIMAGE_SHARDS", "8")), 8)
+        nshards = clamp(nshards, 1, 32)
+        push!(env, "JULIA_IMAGE_SHARD_CACHE" => shard_cache_dir)
+        push!(env, "JULIA_IMAGE_SHARDS" => nshards)
+        push!(env, "JULIA_IMAGE_NO_PARALLEL" => 1)
+        push!(env, "JULIA_IMAGE_PARTITION_MODE" => "stable")
+    end
+
     io = open(pipeline(addenv(`$(julia_cmd(;cpu_target)::Cmd)
                                $(flags)
                                $(opts)
@@ -3396,8 +3423,7 @@ function create_expr_cache(pkg::PkgId, input::PkgLoadSpec, output::String, outpu
                                --startup-file=no --history-file=no --warn-overwrite=yes
                                $(have_color === nothing ? "--color=auto" : have_color ? "--color=yes" : "--color=no")
                                -`,
-                              "OPENBLAS_NUM_THREADS" => 1,
-                              "JULIA_NUM_THREADS" => 1),
+                              env...),
                        stderr = internal_stderr, stdout = internal_stdout),
               "w", stdout)
     # write data over stdin to avoid the (unlikely) case of exceeding max command line size

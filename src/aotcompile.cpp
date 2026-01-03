@@ -36,6 +36,10 @@
 #include <llvm/Bitcode/BitcodeReader.h>
 #include "llvm/Object/ArchiveWriter.h"
 #include <llvm/IR/IRPrintingPasses.h>
+#include <llvm/Support/MD5.h>
+#include <llvm/Support/FileSystem.h>
+#include <llvm/Support/MemoryBuffer.h>
+#include <llvm/Support/Path.h>
 
 #include <llvm/IR/LegacyPassManagers.h>
 #include <llvm/Transforms/Utils/Cloning.h>
@@ -45,6 +49,10 @@
 using namespace llvm;
 
 #include <zstd.h>
+
+#include <limits>
+
+#include <algorithm>
 
 #include "jitlayers.h"
 #include "serialize.h"
@@ -1268,6 +1276,110 @@ struct Partition {
     size_t weight;
 };
 
+// Simple boolean env parsing: treat unset/empty/"0"/"false"/"no" as false, everything else as true.
+static inline bool jl_env_truthy(const char *env)
+{
+    if (!env || !*env)
+        return false;
+    StringRef s(env);
+    if (s == "0" || s.equals_insensitive("false") || s.equals_insensitive("no"))
+        return false;
+    return true;
+}
+
+static inline unsigned jl_env_uint(const char *name, unsigned fallback=0)
+{
+    const char *env = getenv(name);
+    if (!env || !*env)
+        return fallback;
+    char *endptr;
+    unsigned long val = strtoul(env, &endptr, 10);
+    if (endptr == env || *endptr || val == 0)
+        return fallback;
+    if (val > std::numeric_limits<unsigned>::max())
+        return fallback;
+    return (unsigned)val;
+}
+
+static inline bool jl_image_no_parallel(void)
+{
+    return jl_env_truthy(getenv("JULIA_IMAGE_NO_PARALLEL"));
+}
+
+static inline bool jl_image_partition_stable(void)
+{
+    if (const char *mode = getenv("JULIA_IMAGE_PARTITION_MODE")) {
+        if (!*mode)
+            return false;
+        StringRef s(mode);
+        if (s.equals_insensitive("stable") || s.equals_insensitive("hash"))
+            return true;
+        if (s.equals_insensitive("default") || s.equals_insensitive("weight"))
+            return false;
+    }
+    // If shard caching is enabled but no mode was specified, prefer stable partitioning.
+    if (const char *dir = getenv("JULIA_IMAGE_SHARD_CACHE"))
+        return *dir;
+    return false;
+}
+
+// Compute a content-addressed cache key for the *pre-optimization* IR of a shard.
+//
+// This is intentionally based on LLVM bitcode of the shard module, plus a few
+// high-level codegen knobs. If the key matches, reusing the cached object file
+// is semantics-preserving.
+static std::string jl_image_shard_obj_cache_key(Module &M, TargetMachine &TM)
+{
+    // Serialize the (unoptimized) shard module to bitcode
+    SmallVector<char, 0> bc;
+    raw_svector_ostream OS(bc);
+    PassBuilder PB;
+    AnalysisManagers AM{TM, PB, OptimizationLevel::O0};
+    ModulePassManager MPM;
+    MPM.addPass(BitcodeWriterPass(OS));
+    MPM.run(M, AM.MAM);
+
+    MD5 md5;
+    md5.update("jl-image-shard-obj-v1");
+    md5.update(TM.getTargetTriple().str());
+    md5.update(TM.getTargetCPU());
+    md5.update(TM.getTargetFeatureString());
+    md5.update(std::to_string(jl_options.opt_level));
+    md5.update(std::to_string(jl_options.debug_level));
+    md5.update(ArrayRef<uint8_t>((const uint8_t*)bc.data(), bc.size()));
+
+    MD5::MD5Result res;
+    md5.final(res);
+    SmallString<32> out;
+    MD5::stringifyResult(res, out);
+    return out.str().str();
+}
+
+static bool jl_read_all(StringRef path, SmallVectorImpl<char> &out)
+{
+    auto bufOrErr = MemoryBuffer::getFile(path, /*FileSize=*/-1, /*RequiresNullTerminator=*/false);
+    if (!bufOrErr)
+        return false;
+    StringRef data = bufOrErr.get()->getBuffer();
+    out.assign(data.begin(), data.end());
+    return true;
+}
+
+static void jl_write_all_atomic(StringRef path, ArrayRef<char> data)
+{
+    // Best-effort. Failure to cache should never fail compilation.
+    SmallString<256> tmpPath;
+    int fd = -1;
+    std::error_code ec = sys::fs::createUniqueFile(Twine(path) + ".tmp%%%%%%", fd, tmpPath);
+    if (ec)
+        return;
+    {
+        raw_fd_ostream OS(fd, /*shouldClose=*/true);
+        OS.write(data.data(), data.size());
+    }
+    sys::fs::rename(tmpPath, path);
+}
+
 static inline bool verify_partitioning(const SmallVectorImpl<Partition> &partitions, const Module &M, DenseMap<GlobalValue *, unsigned> &fvars, DenseMap<GlobalValue *, unsigned> &gvars) {
     bool bad = false;
 #ifndef JL_NDEBUG
@@ -1342,8 +1454,14 @@ static inline bool verify_partitioning(const SmallVectorImpl<Partition> &partiti
     return !bad;
 }
 
-// Chop a module up as equally as possible by weight into threads partitions
-static SmallVector<Partition, 32> partitionModule(Module &M, unsigned threads) {
+// Chop a module into `threads` partitions.
+//
+// When `stable == false` (default), we attempt to balance partitions by weight.
+// When `stable == true`, we assign partitions by a hash of each union-find root
+// name. This intentionally sacrifices perfect balancing in favor of *stability*
+// across small code changes, which enables incremental reuse of cached shard
+// artifacts (similar in spirit to Rust codegen units).
+static SmallVector<Partition, 32> partitionModule(Module &M, unsigned threads, bool stable) {
     //Start by stripping fvars and gvars, which helpfully removes their uses as well
     DenseMap<GlobalValue *, unsigned> fvars, gvars;
     get_fvars_gvars(M, fvars, gvars);
@@ -1422,32 +1540,22 @@ static SmallVector<Partition, 32> partitionModule(Module &M, unsigned threads) {
     }
 
     SmallVector<Partition, 32> partitions(threads);
-    // always get the smallest partition first
-    auto pcomp = [](const Partition *p1, const Partition *p2) {
-        return p1->weight > p2->weight;
-    };
-    std::priority_queue<Partition *, SmallVector<Partition *, 0>, decltype(pcomp)> pq(pcomp);
-    for (unsigned i = 0; i < threads; ++i) {
-        pq.push(&partitions[i]);
-    }
-
-    SmallVector<unsigned, 0> idxs(partitioner.nodes.size());
-    std::iota(idxs.begin(), idxs.end(), 0);
-    std::sort(idxs.begin(), idxs.end(), [&](unsigned a, unsigned b) {
-        //because roots have more weight than their children,
-        //we can sort by weight and get the roots first
-        return partitioner.nodes[a].weight > partitioner.nodes[b].weight;
-    });
-
-    // Assign the root of each partition to a partition, then assign its children to the same one
-    for (unsigned idx = 0; idx < idxs.size(); ++idx) {
-        auto i = idxs[idx];
-        auto root = partitioner.find(i);
-        assert(root == i || partitioner.nodes[root].weight == 0);
-        if (partitioner.nodes[root].weight) {
-            auto &node = partitioner.nodes[root];
-            auto &P = *pq.top();
-            pq.pop();
+    if (stable) {
+        // Stable assignment: choose a partition for each union-find root using a hash of its name.
+        DenseMap<unsigned, unsigned> root_to_partition;
+        root_to_partition.reserve(partitioner.nodes.size());
+        for (unsigned i = 0; i < partitioner.nodes.size(); ++i) {
+            unsigned root = partitioner.find(i);
+            if (root_to_partition.count(root))
+                continue;
+            StringRef name = partitioner.nodes[root].GV->getName();
+            size_t h = (size_t)hash_value(name);
+            root_to_partition[root] = (unsigned)(h % threads);
+        }
+        for (unsigned i = 0; i < partitioner.nodes.size(); ++i) {
+            unsigned root = partitioner.find(i);
+            auto &node = partitioner.nodes[i];
+            auto &P = partitions[root_to_partition[root]];
             auto name = node.GV->getName();
             P.globals.insert({name, true});
             if (fvars.count(node.GV))
@@ -1455,24 +1563,62 @@ static SmallVector<Partition, 32> partitionModule(Module &M, unsigned threads) {
             if (gvars.count(node.GV))
                 P.gvars[name] = gvars[node.GV];
             P.weight += node.weight;
-            node.weight = 0;
-            node.size = &P - partitions.data();
-            pq.push(&P);
         }
-        if (root != i) {
-            auto &node = partitioner.nodes[i];
-            assert(node.weight != 0);
-            // we assigned its root already, so just add it to the root's partition
-            // don't touch the priority queue, since we're not changing the weight
-            auto &P = partitions[partitioner.nodes[root].size];
-            auto name = node.GV->getName();
-            P.globals.insert({name, true});
-            if (fvars.count(node.GV))
-                P.fvars[name] = fvars[node.GV];
-            if (gvars.count(node.GV))
-                P.gvars[name] = gvars[node.GV];
-            node.weight = 0;
-            node.size = partitioner.nodes[root].size;
+    }
+    else {
+        // Weight-balanced assignment: greedy bin packing by (approximate) cost.
+        // Always get the smallest partition first.
+        auto pcomp = [](const Partition *p1, const Partition *p2) {
+            return p1->weight > p2->weight;
+        };
+        std::priority_queue<Partition *, SmallVector<Partition *, 0>, decltype(pcomp)> pq(pcomp);
+        for (unsigned i = 0; i < threads; ++i) {
+            pq.push(&partitions[i]);
+        }
+
+        SmallVector<unsigned, 0> idxs(partitioner.nodes.size());
+        std::iota(idxs.begin(), idxs.end(), 0);
+        std::sort(idxs.begin(), idxs.end(), [&](unsigned a, unsigned b) {
+            // because roots have more weight than their children,
+            // we can sort by weight and get the roots first
+            return partitioner.nodes[a].weight > partitioner.nodes[b].weight;
+        });
+
+        // Assign the root of each component to a partition, then assign its children to the same one.
+        for (unsigned idx = 0; idx < idxs.size(); ++idx) {
+            auto i = idxs[idx];
+            auto root = partitioner.find(i);
+            assert(root == i || partitioner.nodes[root].weight == 0);
+            if (partitioner.nodes[root].weight) {
+                auto &node = partitioner.nodes[root];
+                auto &P = *pq.top();
+                pq.pop();
+                auto name = node.GV->getName();
+                P.globals.insert({name, true});
+                if (fvars.count(node.GV))
+                    P.fvars[name] = fvars[node.GV];
+                if (gvars.count(node.GV))
+                    P.gvars[name] = gvars[node.GV];
+                P.weight += node.weight;
+                node.weight = 0;
+                node.size = &P - partitions.data();
+                pq.push(&P);
+            }
+            if (root != i) {
+                auto &node = partitioner.nodes[i];
+                assert(node.weight != 0);
+                // we assigned its root already, so just add it to the root's partition
+                // don't touch the priority queue, since we're not changing the weight
+                auto &P = partitions[partitioner.nodes[root].size];
+                auto name = node.GV->getName();
+                P.globals.insert({name, true});
+                if (fvars.count(node.GV))
+                    P.fvars[name] = fvars[node.GV];
+                if (gvars.count(node.GV))
+                    P.gvars[name] = gvars[node.GV];
+                node.weight = 0;
+                node.size = partitioner.nodes[root].size;
+            }
         }
     }
 
@@ -1952,6 +2098,26 @@ static SmallVector<AOTOutputs, 16> add_output(Module &M, TargetMachine &TM, Stri
         return outputs;
     }
 
+    // Optional incremental shard cache. When enabled, we reuse previously-emitted
+    // object files for shards whose *pre-optimization* IR hash matches.
+    //
+    // This is designed primarily for pkgimage rebuilds after small source changes.
+    // It is intentionally content-addressed (like Rust incremental object reuse).
+    StringRef shard_cache_dir;
+    bool cache_obj_only = false;
+    if (obj_out && !unopt_out && !opt_out && !asm_out) {
+        if (const char *dir = getenv("JULIA_IMAGE_SHARD_CACHE")) {
+            if (*dir) {
+                shard_cache_dir = dir;
+                cache_obj_only = true;
+                // best-effort
+                sys::fs::create_directories(shard_cache_dir);
+            }
+        }
+    }
+    bool no_parallel = jl_image_no_parallel();
+    bool stable_partitioning = jl_image_partition_stable();
+
     partition_timer.startTimer();
     uint64_t counter = 0;
     // Partitioning requires all globals to have names.
@@ -1961,7 +2127,7 @@ static SmallVector<AOTOutputs, 16> add_output(Module &M, TargetMachine &TM, Stri
             G.setName("jl_ext_" + Twine(counter++));
         }
     }
-    auto partitions = partitionModule(M, threads);
+    auto partitions = partitionModule(M, threads, stable_partitioning);
     partition_timer.stopTimer();
 
     serialize_timer.startTimer();
@@ -1973,20 +2139,16 @@ static SmallVector<AOTOutputs, 16> add_output(Module &M, TargetMachine &TM, Stri
 
     output_timer.startTimer();
 
-    // Start all of the worker threads
+    // Start all of the worker threads (unless explicitly disabled).
     {
         JL_TIMING(NATIVE_AOT, NATIVE_Opt);
-        std::vector<uv_thread_t> workers(threads);
-        for (unsigned i = 0; i < threads; i++) {
-            schedule_uv_thread(&workers[i], [&, i]() {
+        if (no_parallel) {
+            for (unsigned i = 0; i < threads; i++) {
                 LLVMContext ctx;
                 ctx.setDiscardValueNames(true);
                 // Lazily deserialize the entire module
                 timers[i].deserialize.startTimer();
                 auto EM = getLazyBitcodeModule(MemoryBufferRef(StringRef(serialized.data(), serialized.size()), "Optimized"), ctx);
-                // Make sure this also fails with only julia, but not LLVM assertions enabled,
-                // otherwise, the first error we hit is the LLVM module verification failure,
-                // which will look very confusing, because the module was partially deserialized.
                 bool deser_succeeded = (bool)EM;
                 auto M = cantFail(std::move(EM), "Error loading module");
                 assert(deser_succeeded); (void)deser_succeeded;
@@ -2008,13 +2170,62 @@ static SmallVector<AOTOutputs, 16> add_output(Module &M, TargetMachine &TM, Stri
                         CU->replaceOperandWith(0, topfile);
                 timers[i].construct.stopTimer();
 
-                outputs[i] = add_output_impl(*M, TM, timers[i], unopt_out, opt_out, obj_out, asm_out);
-            });
+                if (cache_obj_only) {
+                    std::string key = jl_image_shard_obj_cache_key(*M, TM);
+                    SmallString<256> path(shard_cache_dir);
+                    sys::path::append(path, key + ".o");
+                    if (jl_read_all(path.str(), outputs[i].obj)) {
+                        continue; // cache hit
+                    }
+                    outputs[i] = add_output_impl(*M, TM, timers[i], unopt_out, opt_out, obj_out, asm_out);
+                    jl_write_all_atomic(path.str(), outputs[i].obj);
+                }
+                else {
+                    outputs[i] = add_output_impl(*M, TM, timers[i], unopt_out, opt_out, obj_out, asm_out);
+                }
+            }
         }
+        else {
+            std::vector<uv_thread_t> workers(threads);
+            for (unsigned i = 0; i < threads; i++) {
+                schedule_uv_thread(&workers[i], [&, i]() {
+                    LLVMContext ctx;
+                    ctx.setDiscardValueNames(true);
+                    // Lazily deserialize the entire module
+                    timers[i].deserialize.startTimer();
+                    auto EM = getLazyBitcodeModule(MemoryBufferRef(StringRef(serialized.data(), serialized.size()), "Optimized"), ctx);
+                    // Make sure this also fails with only julia, but not LLVM assertions enabled,
+                    // otherwise, the first error we hit is the LLVM module verification failure,
+                    // which will look very confusing, because the module was partially deserialized.
+                    bool deser_succeeded = (bool)EM;
+                    auto M = cantFail(std::move(EM), "Error loading module");
+                    assert(deser_succeeded); (void)deser_succeeded;
+                    timers[i].deserialize.stopTimer();
 
-        // Wait for all of the worker threads to finish
-        for (unsigned i = 0; i < threads; i++)
-            uv_thread_join(&workers[i]);
+                    timers[i].materialize.startTimer();
+                    materializePreserved(*M, partitions[i]);
+                    timers[i].materialize.stopTimer();
+
+                    timers[i].construct.startTimer();
+                    std::string suffix = "_" + std::to_string(i);
+                    construct_vars(*M, partitions[i], suffix);
+                    M->setModuleFlag(Module::Error, "julia.mv.suffix", MDString::get(M->getContext(), suffix));
+                    // The DICompileUnit file is not used for anything, but ld64 requires it be a unique string per object file
+                    // or it may skip emitting debug info for that file. Here set it to ./julia#N
+                    DIFile *topfile = DIFile::get(M->getContext(), "julia#" + std::to_string(i), ".");
+                    if (M->getNamedMetadata("llvm.dbg.cu"))
+                        for (auto CU: M->getNamedMetadata("llvm.dbg.cu")->operands())
+                            CU->replaceOperandWith(0, topfile);
+                    timers[i].construct.stopTimer();
+
+                    outputs[i] = add_output_impl(*M, TM, timers[i], unopt_out, opt_out, obj_out, asm_out);
+                });
+            }
+
+            // Wait for all of the worker threads to finish
+            for (unsigned i = 0; i < threads; i++)
+                uv_thread_join(&workers[i]);
+        }
     }
 
     output_timer.stopTimer();
@@ -2306,6 +2517,18 @@ void jl_dump_native_impl(void *native_code,
                 << "    weight: " << module_info.weight << "\n"
             );
             threads = compute_image_thread_count(module_info);
+            // Optional override: allow splitting the image into a fixed number of
+            // shards (codegen units) even if we'd normally choose 1.
+            //
+            // This is primarily intended for incremental reuse of previously emitted
+            // shard artifacts (see JULIA_IMAGE_SHARD_CACHE).
+            if (unsigned requested = jl_env_uint("JULIA_IMAGE_SHARDS")) {
+                // Keep this bounded: very high shard counts tend to regress build time.
+                threads = std::min(requested, 32u);
+                threads = std::max(threads, 1u);
+                LLVM_DEBUG(dbgs() << "Overriding aot image shards to " << threads
+                                  << " due to JULIA_IMAGE_SHARDS\n");
+            }
             LLVM_DEBUG(dbgs() << "Using " << threads << " to emit aot image\n");
             nfvars = data->jl_sysimg_fvars.size();
             ngvars = data->jl_sysimg_gvars.size();
