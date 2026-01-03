@@ -7,6 +7,7 @@
 #include <llvm/TargetParser/Triple.h>
 #include "llvm/Support/CodeGen.h"
 #include <llvm/ADT/Statistic.h>
+#include <llvm/ADT/Hashing.h>
 #include <llvm/Analysis/TargetLibraryInfo.h>
 #include <llvm/Analysis/TargetTransformInfo.h>
 #include <llvm/IR/DataLayout.h>
@@ -1457,10 +1458,11 @@ static inline bool verify_partitioning(const SmallVectorImpl<Partition> &partiti
 // Chop a module into `threads` partitions.
 //
 // When `stable == false` (default), we attempt to balance partitions by weight.
-// When `stable == true`, we assign partitions by a hash of each union-find root
-// name. This intentionally sacrifices perfect balancing in favor of *stability*
-// across small code changes, which enables incremental reuse of cached shard
-// artifacts (similar in spirit to Rust codegen units).
+// When `stable == true`, we assign partitions by a hash of a deterministic
+// representative name per union-find component. This intentionally sacrifices
+// perfect balancing in favor of *stability* across small code changes, which
+// enables incremental reuse of cached shard artifacts (similar in spirit to Rust
+// codegen units).
 static SmallVector<Partition, 32> partitionModule(Module &M, unsigned threads, bool stable) {
     //Start by stripping fvars and gvars, which helpfully removes their uses as well
     DenseMap<GlobalValue *, unsigned> fvars, gvars;
@@ -1541,15 +1543,42 @@ static SmallVector<Partition, 32> partitionModule(Module &M, unsigned threads, b
 
     SmallVector<Partition, 32> partitions(threads);
     if (stable) {
-        // Stable assignment: choose a partition for each union-find root using a hash of its name.
-        DenseMap<unsigned, unsigned> root_to_partition;
-        root_to_partition.reserve(partitioner.nodes.size());
+        // Stable assignment: choose a partition for each union-find component using a deterministic
+        // representative name.
+        //
+        // Two key properties that matter for incremental shard caching:
+        //   1. assignment should be stable across small code changes, and
+        //   2. assignment should be independent of union-find root selection (which can vary with merge order).
+        //
+        // We compute a representative per component as the lexicographically smallest member name,
+        // preferring non-synthetic names over the auto-generated `jl_ext_*` names when available.
+        DenseMap<unsigned, StringRef> root_rep;
+        root_rep.reserve(partitioner.nodes.size());
         for (unsigned i = 0; i < partitioner.nodes.size(); ++i) {
             unsigned root = partitioner.find(i);
-            if (root_to_partition.count(root))
+            StringRef name = partitioner.nodes[i].GV->getName();
+            auto it = root_rep.find(root);
+            if (it == root_rep.end()) {
+                root_rep[root] = name;
                 continue;
-            StringRef name = partitioner.nodes[root].GV->getName();
-            size_t h = (size_t)hash_value(name);
+            }
+            auto is_ext = [](StringRef s) { return s.starts_with("jl_ext_"); };
+            bool cur_ext = is_ext(it->second);
+            bool name_ext = is_ext(name);
+            if (cur_ext && !name_ext) {
+                it->second = name;
+            }
+            else if (cur_ext == name_ext && name.compare(it->second) < 0) {
+                it->second = name;
+            }
+        }
+
+        DenseMap<unsigned, unsigned> root_to_partition;
+        root_to_partition.reserve(root_rep.size());
+        for (auto &kv : root_rep) {
+            unsigned root = kv.first;
+            StringRef rep = kv.second;
+            size_t h = (size_t)hash_value(rep);
             root_to_partition[root] = (unsigned)(h % threads);
         }
         for (unsigned i = 0; i < partitioner.nodes.size(); ++i) {
@@ -1562,7 +1591,9 @@ static SmallVector<Partition, 32> partitionModule(Module &M, unsigned threads, b
                 P.fvars[name] = fvars[node.GV];
             if (gvars.count(node.GV))
                 P.gvars[name] = gvars[node.GV];
-            P.weight += node.weight;
+            // Only count the component weight once, using the union-find root which stores the aggregated weight.
+            if (root == i)
+                P.weight += partitioner.nodes[root].weight;
         }
     }
     else {

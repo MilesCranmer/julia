@@ -3408,7 +3408,55 @@ function create_expr_cache(pkg::PkgId, input::PkgLoadSpec, output::String, outpu
         # and precompile locking already uses this same (prefs_hash=0, project="") key.
         shard_cache_dir = compilecache_path(pkg, UInt64(0); flags=cacheflags, project="") * ".shards"
         mkpath(shard_cache_dir)
-        nshards = something(tryparse(Int, get(ENV, "JULIA_PKGIMAGE_SHARDS", "8")), 8)
+        shards_env = get(ENV, "JULIA_PKGIMAGE_SHARDS", nothing)
+        shards_file = joinpath(shard_cache_dir, "shards.count")
+        nshards = nothing
+        if shards_env === nothing
+            # Reuse the previously chosen shard count to keep partitioning stable across rebuilds.
+            # This makes incremental shard-cache hits much more likely.
+            if isfile(shards_file)
+                try
+                    nshards = parse(Int, strip(read(shards_file, String)))
+                catch
+                    nshards = nothing
+                end
+            end
+            if nshards === nothing
+                nshards = 8
+                try
+                    open(shards_file, "w") do io
+                        print(io, nshards)
+                    end
+                catch
+                end
+            end
+        else
+            if shards_env == "auto"
+                # Optional heuristic: pick shard count based on the existing .ji size (if any),
+                # falling back to a conservative default for first-time builds.
+                ji_size = isfile(output) ? filesize(output) : 0
+                if ji_size == 0
+                    nshards = 8
+                elseif ji_size < 2_000_000
+                    nshards = 2
+                elseif ji_size < 8_000_000
+                    nshards = 4
+                elseif ji_size < 32_000_000
+                    nshards = 8
+                else
+                    nshards = 16
+                end
+                try
+                    open(shards_file, "w") do io
+                        print(io, nshards)
+                    end
+                catch
+                end
+            else
+                nshards = tryparse(Int, shards_env)
+                nshards === nothing && (nshards = 8)
+            end
+        end
         nshards = clamp(nshards, 1, 32)
         push!(env, "JULIA_IMAGE_SHARD_CACHE" => shard_cache_dir)
         push!(env, "JULIA_IMAGE_SHARDS" => nshards)
